@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Forevo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="app">
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h2>Forevo</h2>
+                <a href="{{ url_for('logout') }}" class="logout-btn">Выйти</a>
+            </div>
+            <div class="chat-list" id="chatList"></div>
+        </div>
+        
+        <div class="main">
+            <div class="chat-header" id="chatHeader" style="display: none;">
+                <div class="chat-avatar" id="chatAvatar">#</div>
+                <h3 id="chatTitle">Выберите чат</h3>
+            </div>
+            <div class="messages" id="messagesContainer">
+                <div class="welcome-message">
+                    <h2>👋 Добро пожаловать в Forevo!</h2>
+                    <p>Выберите чат или создайте новый</p>
+                </div>
+            </div>
+            <div class="input-area" id="messageInputArea" style="display: none;">
+                <input type="text" id="messageInput" placeholder="Введите сообщение..." autocomplete="off">
+                <button id="sendBtn">Отправить</button>
+            </div>
+        </div>
+        
+        <div class="users-sidebar">
+            <h4>Пользователи</h4>
+            <div id="usersList"></div>
+            <button class="new-group-btn" id="createGroupBtn">+ Создать группу</button>
+        </div>
+    </div>
+    
+    <div class="modal" id="groupModal">
+        <div class="modal-content">
+            <h3>Новая группа</h3>
+            <input type="text" id="groupName" placeholder="Название группы">
+            <div class="member-select" id="memberSelect"></div>
+            <div class="modal-buttons">
+                <button class="btn-primary" id="confirmCreateGroup">Создать</button>
+                <button class="btn-secondary" id="cancelGroupModal">Отмена</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+       const state = {
+    currentChatId: null,
+    currentChatType: null,
+    currentUserId: '{{ current_user.id }}',
+    currentUsername: '{{ current_user.username }}',
+    socket: null,
+    chats: [],
+    users: []
+};
+
+function initSocket() {
+    state.socket = io({
+        transports: ['websocket', 'polling']
+    });
+    
+    state.socket.on('connect', () => {
+        console.log('✅ Подключено к серверу');
+    });
+    
+    state.socket.on('user_status', (data) => {
+        console.log('👤 Статус пользователя:', data);
+        const user = state.users.find(u => u.id === data.user_id);
+        if (user) user.is_online = data.is_online;
+        renderUsers();
+        renderChatList();
+    });
+    
+    state.socket.on('new_message', (message) => {
+        console.log('📨 Новое сообщение в чат:', message);
+        if (state.currentChatId === message.chat_id) {
+            addMessageToUI(message, message.sender_id === state.currentUserId);
+        }
+        loadChats();
+    });
+    
+    state.socket.on('new_private', (message) => {
+        console.log('📨 Новое личное сообщение:', message);
+        const otherId = message.sender_id === state.currentUserId ? message.receiver_id : message.sender_id;
+        if (state.currentChatId === otherId && state.currentChatType === 'private') {
+            addMessageToUI(message, message.sender_id === state.currentUserId);
+        }
+        loadChats();
+    });
+    
+    state.socket.on('chat_created', (chat) => {
+        console.log('🆕 Новый чат создан:', chat);
+        loadChats();
+    });
+    
+    state.socket.on('connect_error', (err) => {
+        console.error('❌ Ошибка подключения:', err);
+    });
+}
+
+async function loadChats() {
+    const res = await fetch('/api/chats');
+    state.chats = await res.json();
+    console.log('📋 Чаты загружены:', state.chats);
+    renderChatList();
+}
+
+async function loadUsers() {
+    const res = await fetch('/api/users');
+    state.users = await res.json();
+    console.log('👥 Пользователи загружены:', state.users);
+    renderUsers();
+}
+
+function renderChatList() {
+    const container = document.getElementById('chatList');
+    if (!container) return;
+    
+    container.innerHTML = state.chats.map(chat => {
+        const lastMsg = chat.last_message?.content || 'Нет сообщений';
+        return `
+            <div class="chat-item ${state.currentChatId === chat.id ? 'active' : ''}" data-chat-id="${chat.id}" data-is-group="${chat.is_group}">
+                <div class="chat-avatar">${chat.name[0]?.toUpperCase() || '#'}</div>
+                <div class="chat-info">
+                    <div class="chat-name">${chat.name}</div>
+                    <div class="chat-last">${lastMsg.substring(0, 30)}${lastMsg.length > 30 ? '...' : ''}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+    
+    container.querySelectorAll('.chat-item').forEach(el => {
+        el.addEventListener('click', () => openChat(el.dataset.chatId, el.dataset.isGroup === 'true'));
+    });
+}
+
+async function openChat(chatId, isGroup) {
+    console.log(`📂 Открываем чат: ${chatId}, группа: ${isGroup}`);
+    state.currentChatId = chatId;
+    state.currentChatType = isGroup ? 'group' : 'private';
+    
+    document.getElementById('chatHeader').style.display = 'flex';
+    document.getElementById('messageInputArea').style.display = 'flex';
+    document.getElementById('messagesContainer').innerHTML = '';
+    
+    const chat = state.chats.find(c => c.id === chatId);
+    if (chat) {
+        document.getElementById('chatTitle').textContent = chat.name;
+        document.getElementById('chatAvatar').textContent = chat.name[0]?.toUpperCase() || '#';
+    }
+    
+    const url = isGroup ? `/api/messages/${chatId}` : `/api/private/${chatId}`;
+    const res = await fetch(url);
+    const messages = await res.json();
+    console.log(`📜 Загружено ${messages.length} сообщений`);
+    messages.forEach(msg => addMessageToUI(msg, msg.sender_id === state.currentUserId));
+    
+    renderChatList();
+}
+
+function addMessageToUI(message, isOutgoing) {
+    const container = document.getElementById('messagesContainer');
+    const div = document.createElement('div');
+    div.className = `message ${isOutgoing ? 'outgoing' : 'incoming'}`;
+    const time = new Date(message.sent_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    div.innerHTML = `
+        ${!isOutgoing ? `<div class="message-sender">${message.sender_name}</div>` : ''}
+        <div>${escapeHtml(message.content)}</div>
+        <div class="message-time">${time}</div>
+    `;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function sendMessage() {
+    const input = document.getElementById('messageInput');
+    const text = input.value.trim();
+    if (!text || !state.currentChatId) return;
+    
+    console.log(`📤 Отправка сообщения в ${state.currentChatType}: ${text}`);
+    
+    if (state.currentChatType === 'group') {
+        state.socket.emit('send_message', { 
+            chat_id: state.currentChatId, 
+            content: text 
+        });
+    } else {
+        state.socket.emit('send_private', { 
+            receiver_id: state.currentChatId, 
+            content: text 
+        });
+    }
+    input.value = '';
+}
+
+function renderUsers() {
+    const container = document.getElementById('usersList');
+    if (!container) return;
+    
+    container.innerHTML = state.users.map(user => `
+        <div class="user-item" data-user-id="${user.id}">
+            <span class="user-status ${user.is_online ? '' : 'offline'}"></span>
+            <span>${user.username}</span>
+        </div>
+    `).join('');
+    
+    container.querySelectorAll('.user-item').forEach(el => {
+        el.addEventListener('click', async () => {
+            const userId = el.dataset.userId;
+            console.log(`👤 Открываем чат с пользователем: ${userId}`);
+            const res = await fetch(`/api/start_chat/${userId}`, { method: 'POST' });
+            const data = await res.json();
+            await loadChats();
+            openChat(data.chat_id, false);
+        });
+    });
+}
+
+function showGroupModal() {
+    const modal = document.getElementById('groupModal');
+    const memberSelect = document.getElementById('memberSelect');
+    memberSelect.innerHTML = state.users.map(user => `
+        <label class="member-option">
+            <input type="checkbox" value="${user.id}">
+            <span class="user-status ${user.is_online ? '' : 'offline'}"></span>
+            <span>${user.username}</span>
+        </label>
+    `).join('');
+    modal.style.display = 'flex';
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+    initSocket();
+    await loadChats();
+    await loadUsers();
+    
+    document.getElementById('sendBtn').addEventListener('click', sendMessage);
+    document.getElementById('messageInput').addEventListener('keypress', e => {
+        if (e.key === 'Enter') sendMessage();
+    });
+    
+    document.getElementById('createGroupBtn').addEventListener('click', showGroupModal);
+    document.getElementById('cancelGroupModal').addEventListener('click', () => {
+        document.getElementById('groupModal').style.display = 'none';
+    });
+    
+    document.getElementById('confirmCreateGroup').addEventListener('click', async () => {
+        const name = document.getElementById('groupName').value;
+        const selected = [...document.querySelectorAll('#memberSelect input:checked')].map(cb => cb.value);
+        if (!name || selected.length === 0) return alert('Введите название и выберите участников');
+        
+        await fetch('/api/create_group', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, members: selected })
+        });
+        
+        document.getElementById('groupModal').style.display = 'none';
+        document.getElementById('groupName').value = '';
+        await loadChats();
+    });
+});
+    </script>
+</body>
+</html>
